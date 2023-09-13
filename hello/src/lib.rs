@@ -1,13 +1,121 @@
-pub struct ThreadPool;
+use std::{
+    sync::{mpsc, Arc, Mutex}, 
+    thread
+};
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Option<mpsc::Sender<Job>>,
+}
+
+struct Worker {
+    id: usize,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
 
 impl ThreadPool {
+    /// Create a new Threadpool.
+    /// 
+    /// The size is the number of threads in the pool.
+    /// 
+    /// # Panics
+    /// 
+    /// The 'new' function will panic if the size is zero.    
     pub fn new(size: usize) -> ThreadPool {
-        ThreadPool
+        assert!(size > 0); 
+
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = Vec::with_capacity(size);
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        for id in 0..size {
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
+        }
+
+        ThreadPool { workers, sender: Some(sender) }
     }
 
     pub fn execute<F>(&self, f:F)
     where 
         F: FnOnce() + Send + 'static, {
-        
+        let job = Box::new(f);
+        self.sender
+            .as_ref()
+            .unwrap()
+            .send(job)
+            .unwrap();
     }
 }
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
+impl Worker {
+    fn new(
+        id: usize, 
+        receiver: Arc<Mutex<mpsc::Receiver<Job>>>,
+    ) -> Worker {
+        let thread = thread::spawn(move || loop {
+            let message = receiver.lock().unwrap().recv();
+
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; executing.");
+                    job();
+                },
+                Err(_) => {
+                    println!("Worker {id} shutting down.");
+                    break;
+                }
+            }
+        });
+        Worker { id, thread: Some(thread) }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn test_threadpool_creation() {
+        let pool = ThreadPool::new(4);
+        assert_eq!(pool.workers.len(), 4);
+    }
+
+    #[test]
+    fn test_threadpool_execution() {
+        let pool = ThreadPool::new(2);
+        let counter = Arc::new(Mutex::new(0));
+
+        for _ in 0..10 {
+            let counter_clone = Arc::clone(&counter);
+            pool.execute(move || {
+                let mut num = counter_clone.lock().unwrap();
+                *num += 1;
+            });
+        }
+
+        thread::sleep(Duration::from_secs(1));
+
+        let num = counter.lock().unwrap();
+        assert_eq!(*num, 10);
+    }
+}
+
